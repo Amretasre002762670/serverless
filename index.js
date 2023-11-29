@@ -1,6 +1,10 @@
 const axios = require('axios');
 const { Storage } = require('@google-cloud/storage');
 const fs = require('fs');
+const AdmZip = require('adm-zip');
+const AWS = require('aws-sdk');
+const dynamoDB = new AWS.DynamoDB.DocumentClient();
+
 const mailgun = require('mailgun-js')({
   apiKey: process.env.MAILGUN_API_KEY,
   domain: process.env.MAILGUN_DOMAIN,
@@ -13,16 +17,18 @@ fs.writeFileSync(credentialsPath, decode(process.env.SERVICE_ACCOUNT_KEY));
 const storage = new Storage({
   keyFilename: credentialsPath,
 });
-// const domain = process.env.MAILGUN_DOMAIN;
-let userEmail = "";
 exports.handler = async (event) => {
+  let userEmail = "";
+  let assignmentName = "";
   try {
+
     console.log('Received SNS event:', JSON.stringify(event, null, 2));
 
     const snsMessage = JSON.parse(event.Records[0].Sns.Message);
     const time = event.Records[0].Sns.Timestamp;
-    const { submissionUrl, submissionId, assignmentId, assignmentName } = snsMessage;
+    const { submissionUrl, submissionId, assignmentId } = snsMessage;
     userEmail = snsMessage.userEmail;
+    assignmentName = snsMessage.assignmentName;
     const timestamp = new Date(time);
 
     console.log('Timestamp:', timestamp);
@@ -32,14 +38,8 @@ exports.handler = async (event) => {
     const submissionTime = timestamp.toISOString().split('T')[1].split('.')[0];
 
     console.log('Submission Date:', submissionDate);
-    console.log('Submission Time:', submissionTime);
 
     const response = await axios.get(submissionUrl, { responseType: 'stream' });
-
-    if (!response.data || response.data.byteLength === 0) {
-      sendEmail(userEmail, assignmentName, "no-url", submissionTime, submissionDate)
-      throw new Error('The release does not exist or the payload is empty.');
-    }
 
     const tmpFilePath = `/tmp/${submissionId}.zip`;
 
@@ -50,68 +50,85 @@ exports.handler = async (event) => {
         .on('finish', resolve);
     });
 
-    const bucketName = process.env.BUCKET_NAME;
-    const destinationDir = `submissions/${assignmentName}-${assignmentId}/${userEmail}`;
-    const fileName = `${submissionId}`;
+    const zip = new AdmZip(tmpFilePath);
+      const zipEntries = zip.getEntries();
+      const filteredFiles = zipEntries.filter(entry => {
+        return !entry.isDirectory && !entry.entryName.startsWith('.');
+      });
 
-    const bucket = storage.bucket(bucketName);
+      const extractedSize = filteredFiles.length;
 
-    const [file] = await bucket.upload(tmpFilePath, {
-      destination: `${destinationDir}/${fileName}`,
-      metadata: {
-        contentType: 'application/zip',
-        cacheControl: 'no-cache',
-      },
-    });
+    if (extractedSize > 0) {
+      const bucketName = process.env.BUCKET_NAME;
+      const destinationDir = `submissions/${assignmentName}-${assignmentId}/${userEmail}`;
+      const fileName = `${submissionId}`;
 
-    console.log('Uploaded File:', file);
+      const bucket = storage.bucket(bucketName);
 
-    const [url] = await file.getSignedUrl({
-      action: 'read',
-      expires: Date.now() + 7 * 24 * 60 * 60 * 1000,
-    });
-    
-    const bucketPath = `${bucketName}/${destinationDir}/${fileName}`;
+      const [file] = await bucket.upload(tmpFilePath, {
+        destination: `${destinationDir}/${fileName}`,
+        metadata: {
+          contentType: 'application/zip',
+          cacheControl: 'no-cache',
+        },
+      });
 
-    console.log(`Release uploaded to Google Cloud Storage: ${bucketPath}`);
+      console.log('Uploaded File:', file);
 
-    console.log('Destination Path:', destinationDir);
+      // const [url] = await file.getSignedUrl({
+      //   action: 'read',
+      //   expires: Date.now() + 7 * 24 * 60 * 60 * 1000,
+      // });
 
-    await sendEmail(userEmail, assignmentName, "success", url, submissionTime, submissionDate, bucketPath);
+      const bucketPath = `${bucketName}/${destinationDir}/${fileName}`;
 
-    fs.unlinkSync(tmpFilePath);
+      console.log(`Release uploaded to Google Cloud Storage: ${bucketPath}`);
 
-    return {
-      statusCode: 200,
-      body: JSON.stringify('Release downloaded and uploaded successfully.'),
-    };
+      console.log('Destination Path:', destinationDir);
+
+      fs.unlinkSync(tmpFilePath);
+
+      await sendEmail(userEmail, assignmentName, "success", submissionTime, submissionDate, bucketPath);
+      await writeToDynamoDB(submissionId, userEmail, assignmentName, "Success", "Mail successfully sent");
+    } else {
+      console.log("ZIP archive contains empty directory");
+      await sendEmail(userEmail, assignmentName, "no-url", submissionTime, submissionDate);
+      await writeToDynamoDB(submissionId, userEmail, assignmentName, "Fail", "ZIP archive contains empty directory");
+    }
+
   } catch (error) {
     console.error('Error:', error);
-
-    sendEmail(userEmail, assignmentName, "error", submissionTime, submissionDate, bucketPath, error)
-
-    return {
-      statusCode: 500,
-      body: JSON.stringify('Error processing the SNS message.'),
-    };
+    await sendEmail(userEmail, assignmentName, "error", submissionTime, submissionDate, bucketPath, error)
+    return await writeToDynamoDB(submissionId, userEmail, assignmentName, "Fail", "Failed to upload submission");
   }
 };
 
-// async function getSignedUrl(bucketName, fileName) {
-//   const [url] = await storage.bucket(bucketName).file(fileName).getSignedUrl({
-//     action: 'read',
-//     expires: Date.now() + 7 * 24 * 60 * 60 * 1000,
-//   });
-//   return url;
-// }
+async function writeToDynamoDB(submissionId, userEmail, assignmentName, status, Message) {
+  try {
+    const dynamoDBParams = {
+      TableName: process.env.DYNAMO_DB_TABLE_NAME,
+      Item: {
+        submissionId: submissionId,
+        userEmail: userEmail,
+        assignmentName: assignmentName,
+        status: status,
+        timestamp: Date.now(),
+        Message: Message
+      }
+    }
+    console.log("insert into dynamoDB: ", dynamoDBParams);
+    await dynamoDB.put(dynamoDBParams).promise();
+    console.log('Entry added to DynamoDB');
+  } catch (error) {
+    console.error('Error adding entry to DynamoDB:', error);
+  }
+}
 
-async function sendEmail(userEmail, assignmentName, isSuccess = "success", downloadUrl = null, submissionTime, submissionDate, bucketPath = null, error = null) {
-  const formattedDate = new Date(submissionDate).toLocaleDateString('en-US');
-  const formattedTime = new Date(submissionTime).toLocaleTimeString('en-US');
-
-  let successText = `Your submission for "${assignmentName}" on ${submissionDate} at ${submissionTime} has been successfully processed. \n\nRelease uploaded to Google Cloud Storage: "${bucketPath}". \n\nYou can download it from: ${(downloadUrl)}. \n\nRegards \n${process.env.MAILGUN_DOMAIN}`;
-  let errorText = `There was an error processing your submission for ${assignmentName} done on on ${submissionDate} at ${submissionTime}. \nThe error is ${error}. \nPlease try again. \nRegards \n${process.env.MAILGUN_DOMAIN}`;
-  let noUrl = `The ${assignmentName} submitted on ${submissionDate} at ${submissionTime}  is not pointing to a zip file, please submit a valid URL. \nRegards \n${process.env.MAILGUN_DOMAIN}`
+async function sendEmail(userEmail, assignmentName, isSuccess = "success", submissionTime, submissionDate, bucketPath = null, error = null) {
+  let successText = `Good Day, \n\nYour submission for "${assignmentName}" on ${submissionDate} at ${submissionTime} has been successfully processed. \n\nRelease uploaded to Google Cloud Storage: "${bucketPath}". \n\nRegards \n${process.env.MAILGUN_DOMAIN}`;
+  let errorText = `Good Day, \n\nThere was an error processing your submission for ${assignmentName} done on on ${submissionDate} at ${submissionTime}. \n\nThe error is ${error}. \n\nPlease try again. \n\nRegards \n${process.env.MAILGUN_DOMAIN}`;
+  let noUrl = `Good Day, \n\nThe ${assignmentName} submitted on ${submissionDate} at ${submissionTime}  is pointing to a empty zip file, please submit a valid URL. \n\nRegards \n${process.env.MAILGUN_DOMAIN}`;
+  let invalidResponse = `Good Day, \n\nThe ${assignmentName} submitted on ${submissionDate} at ${submissionTime} is invalid git repo, please submit a valid URL. \n\nRegards \n${process.env.MAILGUN_DOMAIN}`
   let message = "";
   console.log(process.env.MAILGUN_DOMAIN, "The domain name");
   console.log("is success is: ", isSuccess);
@@ -119,23 +136,33 @@ async function sendEmail(userEmail, assignmentName, isSuccess = "success", downl
     message = {
       from: `mailgun@${process.env.MAILGUN_DOMAIN}`,
       to: userEmail,
-      subject: 'Submission Successful',
+      subject: `Submission for ${assignmentName} Successful`,
       text: successText
     }
+
   } else if (isSuccess === "no-url") {
     message = {
       from: `mailgun@${process.env.MAILGUN_DOMAIN}`,
       to: userEmail,
-      subject: 'Submission URL is not valid',
+      subject: `Submission URL for ${assignmentName} is empty.`,
       text: noUrl
     }
-  } else {
+  } else if (isSuccess === "invalid-response") {
     message = {
       from: `mailgun@${process.env.MAILGUN_DOMAIN}`,
       to: userEmail,
-      subject: 'Submission Failed',
+      subject: `Submission URL for ${assignmentName} is not valid git`,
+      text: invalidResponse
+    }
+  }
+  else {
+    message = {
+      from: `mailgun@${process.env.MAILGUN_DOMAIN}`,
+      to: userEmail,
+      subject: `Submission Failed for ${assignmentName}`,
       text: errorText
     }
   }
+  // writeToDynamoDB(dynamoDBParams);
   await mailgun.messages().send(message);
 }
