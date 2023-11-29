@@ -10,6 +10,8 @@
   "license": "ISC",
   "dependencies": {
     "@google-cloud/storage": "^7.6.0",
+    "adm-zip": "^0.5.10",
+    "aws-sdk": "^2.1506.0",
     "axios": "^1.6.2",
     "base-64": "^1.0.0",
     "dotenv": "^16.3.1",
